@@ -91,9 +91,15 @@ api_calls: deque = deque(maxlen=30)
 
 DASHBOARD_HEADER = "x-munim-dashboard"  # requests the dashboard tags with this
 
-# Paths that are "page loads / infrastructure", not API calls - never logged,
-# otherwise opening the dashboard or Swagger floods the panel with green rows.
-IGNORED_PATHS = {"/health", "/favicon.ico", "/dashboard", "/docs", "/redoc", "/openapi.json"}
+# Paths that are "page loads / infrastructure / other tools probing", not our
+# API - never logged, otherwise the panel fills with noise we didn't generate:
+#   /health          - monitors pinging
+#   /v1/models       - editor extensions feeling for an OpenAI-compatible server
+#   /dashboard,/docs - page loads
+IGNORED_PATHS = {
+    "/health", "/favicon.ico", "/dashboard", "/docs", "/redoc", "/openapi.json",
+    "/v1/models",
+}
 
 
 @app.middleware("http")
@@ -134,6 +140,18 @@ def health() -> dict:
     in the Live API calls panel.)
     """
     return {"status": "ok", "app": "MunimAI", "orders_in_ledger": len(ledger)}
+
+
+@app.get("/v1/models")
+def v1_models() -> dict:
+    """OpenAI-compatible discovery endpoint.
+
+    Tools on this machine (editor extensions, AI assistants) probe local
+    ports asking GET /v1/models to see if an LLM server lives there. We are
+    an order ledger, not an LLM server - but we answer politely (200 + an
+    empty model list) so their probes stop showing up as 404 errors.
+    """
+    return {"object": "list", "data": []}
 
 
 @app.post("/orders", response_model=OrderOut, status_code=201)
