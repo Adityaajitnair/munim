@@ -28,10 +28,11 @@ Then open in a browser:
 import json
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -80,11 +81,59 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# ---------------------------------------------------------------------------
+# Live API-call recorder (feeds the dashboard's "Live API calls" panel)
+# ---------------------------------------------------------------------------
+
+# Keep only the last 30 calls. deque with maxlen auto-drops the oldest -
+# no manual trimming, no memory growth.
+api_calls: deque = deque(maxlen=30)
+
+DASHBOARD_HEADER = "x-munim-dashboard"  # requests the dashboard tags with this
+
+# Paths that are "page loads / infrastructure", not API calls - never logged,
+# otherwise opening the dashboard or Swagger floods the panel with green rows.
+IGNORED_PATHS = {"/health", "/favicon.ico", "/dashboard", "/docs", "/redoc", "/openapi.json"}
+
+
+@app.middleware("http")
+async def record_api_calls(request: Request, call_next):
+    """Log every HTTP request (method, path, status, duration) - except the
+    dashboard's own polling traffic, so the panel shows only real callers.
+    """
+    start = time.time()
+    response = await call_next(request)          # run the actual endpoint
+    is_dashboard_poll = request.headers.get(DASHBOARD_HEADER) == "1"
+    is_page_load = request.url.path in IGNORED_PATHS
+    if not is_dashboard_poll and not is_page_load:
+        api_calls.append({
+            "method": request.method,
+            "path": request.url.path,
+            "status": response.status_code,
+            "ms": round((time.time() - start) * 1000),
+        })
+    return response
+
+
+@app.get("/calls")
+def list_calls() -> List[dict]:
+    """Recent API calls, newest first (for the dashboard panel)."""
+    return list(reversed(api_calls))
+
 
 @app.get("/")
 def home() -> dict:
     """Tiny health-check page so we can see the server is alive."""
     return {"app": "MunimAI", "orders_in_ledger": len(ledger)}
+
+
+@app.get("/health")
+def health() -> dict:
+    """Standard /health endpoint - monitors and load balancers expect this
+    exact path. (Before this existed, those pings showed up as annoying 404s
+    in the Live API calls panel.)
+    """
+    return {"status": "ok", "app": "MunimAI", "orders_in_ledger": len(ledger)}
 
 
 @app.post("/orders", response_model=OrderOut, status_code=201)
@@ -204,6 +253,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </section>
 
   <section>
+    <h2>📊 Charts <small class="muted">(from the benchmark report)</small></h2>
+    <div style="display:flex; gap:32px; flex-wrap:wrap; align-items:flex-end">
+      <div>
+        <div style="font-size:13px; color:#666; margin-bottom:8px"><b>Pipeline outcomes</b></div>
+        <div style="display:flex; align-items:center; gap:12px">
+          <!-- conic-gradient donut: green slice = orders filled, amber = merchant asked -->
+          <div id="pie"
+               style="width:120px; height:120px; border-radius:50%; position:relative; background:#e2e3e5">
+            <div style="position:absolute; inset:28px; background:#f4f6f8; border-radius:50%"></div>
+          </div>
+          <div id="pie-legend" style="font-size:13px">no data yet</div>
+        </div>
+      </div>
+      <div style="flex:1; min-width:280px">
+        <div style="font-size:13px; color:#666; margin-bottom:8px"><b>Latency timeline (seconds per test clip)</b></div>
+        <div id="timeline"><span class="muted">no data yet</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>🛰️ Live API calls <small class="muted">(your own polling is hidden)</small></h2>
+    <div id="calls"><span class="muted">No external API calls yet - try POST /orders in /docs!</span></div>
+  </section>
+
+  <section>
     <h2>📒 Live ledger <small class="muted">(auto-refreshes)</small></h2>
     <table>
       <thead><tr><th>ID</th><th>Status</th><th>Supplier</th><th>Item</th>
@@ -214,11 +289,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </main>
 <script>
 const fmtRs = n => n == null ? '-' : '₹' + Number(n).toLocaleString('en-IN');
+// The dashboard tags ALL its own requests so the server hides them from
+// the live-calls panel (we only want real traffic there).
+const MY = { headers: { 'x-munim-dashboard': '1' } };
+const pillFor = s => s < 300 ? 'pass' : s < 500 ? 'pending' : 'fail';
 
 async function refresh() {
   try {
+    // ---- live API calls (excluding our own polling) ----
+    try {
+      const calls = await (await fetch('/calls', MY)).json();
+      document.getElementById('calls').innerHTML = calls.length ? calls.map(c => `
+        <div style="margin:3px 0">
+          <span class="pill ${pillFor(c.status)}">${c.status}</span>
+          <b>${c.method}</b> <code>${c.path}</code>
+          <span class="muted">${c.ms} ms</span>
+        </div>`).join('')
+        : '<span class="muted">No external API calls yet - try POST /orders in /docs!</span>';
+    } catch {
+      document.getElementById('calls').innerHTML =
+        '<span class="muted">Could not reach /calls - server issue?</span>';
+    }
+
     // ---- ledger ----
-    const orders = await (await fetch('/orders')).json();
+    const orders = await (await fetch('/orders', MY)).json();
     document.getElementById('m-orders').textContent = orders.length;
     document.getElementById('m-value').textContent =
       fmtRs(orders.reduce((s, o) => s + (o.total_amount || 0), 0));
@@ -239,7 +333,7 @@ async function refresh() {
 
     // ---- benchmark ----
     try {
-      const m = await (await fetch('/metrics')).json();
+      const m = await (await fetch('/metrics', MY)).json();
       document.getElementById('m-bench').textContent =
         `${m.summary.passed}/${m.summary.cases}`;
       document.getElementById('m-lat').textContent =
@@ -251,6 +345,8 @@ async function refresh() {
           <span class="muted">heard: ${c.transcript || '-'}</span><br>
           verdict: ${c.verdict}
         </div>`).join('');
+      renderPie(m);        // draw both charts from the same data
+      renderTimeline(m);
     } catch {
       document.getElementById('m-bench').textContent = 'n/a';
       document.getElementById('m-lat').textContent = 'n/a';
@@ -259,6 +355,48 @@ async function refresh() {
     document.getElementById('ledger').innerHTML =
       '<tr><td colspan="7" class="muted">Server unreachable - is uvicorn running?</td></tr>';
   }
+}
+
+// Charts are hand-drawn (SVG + CSS conic-gradient) -> no libraries to install,
+// works offline during the demo.
+
+function renderPie(m) {
+  const filled = m.summary.orders_filled;
+  const asked  = m.summary.cases - filled;
+  const pct    = filled / m.summary.cases * 100;
+  document.getElementById('pie').style.background =
+    `conic-gradient(#28a745 0% ${pct}%, #ffc107 ${pct}% 100%)`;
+  document.getElementById('pie-legend').innerHTML =
+    `<div style="color:#155724">🟩 ${filled} ordered, entered ledger</div>` +
+    `<div style="color:#856404">🟨 ${asked} asked the merchant (never guessed)</div>` +
+    `<div class="muted">${m.summary.cases} spoken clips tested</div>`;
+}
+
+function renderTimeline(m) {
+  const cases = m.cases;
+  const W = 600, H = 150, pad = 26;              // svg canvas + margins
+  const maxS = Math.max(...cases.map(c => c.secs), 1); // scale to tallest bar
+  const slot = (W - 2 * pad) / cases.length;     // horizontal slot per clip
+  const barW = Math.min(slot - 10, 60);
+
+  const bars = cases.map((c, i) => {
+    const h   = (c.secs / maxS) * (H - pad - 18);
+    const x0  = pad + i * slot + (slot - barW) / 2;
+    const y0  = H - pad - h;
+    return `
+      <rect x="${x0}" y="${y0}" width="${barW}" height="${h}"
+            fill="${c.ok ? '#0b5cab' : '#dc3545'}" rx="3">
+        <title>${c.file}: ${c.secs.toFixed(1)}s - ${c.verdict}</title>
+      </rect>
+      <text x="${x0 + barW / 2}" y="${y0 - 4}" font-size="11"
+            fill="#333" text-anchor="middle">${c.secs.toFixed(1)}</text>
+      <text x="${x0 + barW / 2}" y="${H - 8}" font-size="10"
+            fill="#888" text-anchor="middle">${c.file.slice(0, 2)}</text>`;
+  }).join('');
+
+  document.getElementById('timeline').innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" style="width:100%; height:160px">${bars}</svg>` +
+    `<div class="muted" style="font-size:12px">hover a bar for details · blue = correct behavior, red = failed check</div>`;
 }
 
 refresh();
