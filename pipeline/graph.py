@@ -107,7 +107,11 @@ class OrderState(TypedDict):
 # Prompt: tell the LLM exactly how to convert speech -> structured order
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = "You convert spoken shop orders into structured JSON."
+SYSTEM_PROMPT = (
+    "You convert spoken shop orders into structured JSON. "
+    "A brand/company name (amul, parag, parle-g, britannia...) is the SUPPLIER, "
+    "never the ITEM. The item is the product (milk, biscuit, bread, sugar...)."
+)
 
 USER_PROMPT_TEMPLATE = """A shopkeeper (kirana merchant) ordered supplies out loud.
 Below is the English translation of what they said.
@@ -116,9 +120,10 @@ SPEECH: "{transcript}"
 
 Rules:
 - Convert spoken number words ("one thousand five hundred") into digits (1500).
+- supplier = ONLY the brand/company that was spoken (Amul, Parag, Parle-G...). null if none was spoken.
+- item = the product bought (milk, biscuit, bread...). null if no product was spoken, even when a brand was.
 - Use null for any field the speaker did not clearly say.
 - DO NOT guess or invent items. If the item wasn't spoken, use null.
-- Keep supplier/item names clean and lowercase (brand name can stay capitalized).
 - Reply with the JSON object only."""
 
 # ---------------------------------------------------------------------------
@@ -163,6 +168,16 @@ def map_node(state: OrderState) -> dict:
         # With json_schema mode the reply arrives as a JSON *string*.
         raw = response.choices[0].message.content
         data = json.loads(raw)
+
+        # Normalize "ghost nulls": models sometimes write the WORD "null" /
+        # "none" / "" instead of a real JSON null. Turn those into None so
+        # downstream code treats them as genuinely missing.
+        data = {
+            k: (None if isinstance(v, str) and v.strip().lower() in {"null", "none", ""}
+                else v)
+            for k, v in data.items()
+        }
+
         order = RawOrder.model_validate(data)   # Pydantic validation, just in case
 
         print(f"[map] parsed: {order.model_dump()}")
@@ -232,11 +247,26 @@ def complete_node(state: OrderState) -> dict:
         return {
             "needs_clarification": True,
             "clarification_question": question,
+            "item_guessed": False,
+            "final_order": {},
+        }
+
+    # Case 3b: item known but supplier missing. A purchase order must go
+    # to SOME distributor, so we ask instead of shipping it "to nobody".
+    if supplier is None:
+        print(f"[complete] no supplier for a known item -> needs_clarification")
+        return {
+            "needs_clarification": True,
+            "clarification_question": (
+                f"{item} noted. Which supplier (distributor) is this for?"
+            ),
+            "item_guessed": False,
             "final_order": {},
         }
 
     # Case 4: everything is present -> clean final order.
     return {
+        "item_guessed": False,
         "needs_clarification": False,
         "final_order": {
             "supplier": supplier,
