@@ -1,5 +1,18 @@
 from pydantic import BaseModel, field_validator
 
+class CustomerOrderRequest(BaseModel):
+    item: str
+    quantity: float
+    customer: str | None = None
+
+
+class StockUpsert(BaseModel):
+    item: str
+    quantity: float
+    unit: str | None = None
+    supplier: str | None = None
+    reorder_qty: float | None = None
+    unit_cost: float | None = None
 
 class ParsedOrder(BaseModel):
     """Strict shape the LLM must return (matches the prompt in parser.py)."""

@@ -4,7 +4,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-
+from fastapi.concurrency import run_in_threadpool
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import text as sql_text
@@ -21,6 +21,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("munimai")
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
+from . import config, intent, inventory, matching, mock_whatsapp, parser, stt, tts, workflow
+from .models import CustomerOrder, LedgerEntry, Order, StockItem, Supplier
+from .schemas import CustomerOrderRequest, ExecutedCallback, StockUpsert, TTSRequest
+
+SEED_STOCK = [  # name, aliases, qty, unit, supplier, reorder_qty, unit_cost
+    ("Amul Milk", ["milk", "doodh", "अमूल दूध"], 20, "packet", "Amul", 50, 30),
+    ("Parle-G", ["parle g", "पारले जी"], 30, "packet", "Parle", 100, 8),
+    ("Good Day Biscuits", ["good day", "gud day"], 18, "packet", "Britannia", 60, 20),
+    ("Aloo Bhujia", ["bhujia", "haldiram bhujia"], 25, "packet", "Haldiram", 40, 45),
+]
 
 SEED_SUPPLIERS = [
     ("Amul", ["अमूल", "amool", "amul dairy"]),
@@ -36,12 +46,19 @@ DEMO_WHATSAPP = "+910000000000"  # replace with your sandbox-joined number
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
-        if db.query(Supplier).count() == 0:
-            for name, aliases in SEED_SUPPLIERS:
+        have = {s.name for s in db.query(Supplier).all()}
+        for name, aliases in SEED_SUPPLIERS:
+            if name not in have:
                 db.add(Supplier(name=name, aliases=aliases, whatsapp_number=DEMO_WHATSAPP))
+        db.commit()
+
+        if db.query(StockItem).count() == 0:
+            sup = {s.name: s.id for s in db.query(Supplier).all()}
+            for name, aliases, qty, unit, sname, rq, cost in SEED_STOCK:
+                db.add(StockItem(name=name, aliases=aliases, quantity=qty, unit=unit,
+                                 supplier_id=sup.get(sname), reorder_qty=rq, unit_cost=cost))
             db.commit()
     yield
-
 
 app = FastAPI(title="MunimAI", version="0.1", lifespan=lifespan)
 
@@ -224,7 +241,7 @@ async def confirm(order_id: str = Form(...), decision: str | None = Form(None),
         moved = workflow.confirm_order(db, order)
     except workflow.NotConfirmable as e:
         raise HTTPException(422, {"message": str(e)})
-    dispatch = workflow.dispatch_order(db, order) if moved else "already_confirmed"
+    dispatch = await run_in_threadpool(workflow.dispatch_order, db, order) if moved else "already_confirmed"
     return {"order_id": order.id, "status": order.status, "action": "confirm", "dispatch": dispatch,
             "whatsapp_message": order.whatsapp_message, "transcript": heard}
 
@@ -262,15 +279,24 @@ def list_orders(status: str | None = None, limit: int = 20, db: Session = Depend
 def ledger(db: Session = Depends(get_db)):
     rows = db.query(LedgerEntry).order_by(LedgerEntry.created_at.desc()).all()
     totals: dict[str, float] = {}
-    entries = []
-    for r in rows:
-        totals[r.supplier.name] = totals.get(r.supplier.name, 0) + float(r.amount)
+    merged: dict[tuple, dict] = {}   # one row per supplier + item + unit
+    for r in rows:                   # newest first, so the first row seen sets the label/time
         o = db.get(Order, r.order_id)
-        entries.append({"id": r.id, "order_id": r.order_id, "supplier": r.supplier.name,
-                        "item": o.item, "quantity": float(o.quantity), "unit": o.unit,
-                        "amount": float(r.amount), "created_at": r.created_at.isoformat()})
-    return {"entries": entries, "totals_by_supplier": totals, "grand_total": sum(totals.values())}
-
+        amount = float(r.amount)
+        totals[r.supplier.name] = totals.get(r.supplier.name, 0) + amount
+        key = (r.supplier.name, matching.normalize(o.item), (o.unit or "").lower())
+        e = merged.get(key)
+        if e is None:
+            merged[key] = {"id": r.id, "order_id": r.order_id, "order_ids": [r.order_id],
+                           "supplier": r.supplier.name, "item": o.item,
+                           "quantity": float(o.quantity), "unit": o.unit,
+                           "amount": amount, "created_at": r.created_at.isoformat()}
+        else:
+            e["quantity"] = round(e["quantity"] + float(o.quantity), 2)
+            e["amount"] = round(e["amount"] + amount, 2)
+            e["order_ids"].append(r.order_id)
+    return {"entries": list(merged.values()), "totals_by_supplier": totals,
+            "grand_total": sum(totals.values())}
 
 @app.post("/tts")
 def text_to_speech(req: TTSRequest):
@@ -279,3 +305,59 @@ def text_to_speech(req: TTSRequest):
     except tts.TTSError as e:
         raise HTTPException(503, {"message": "TTS unavailable", "error": str(e)})
     return Response(content=audio, media_type="audio/wav")
+
+from . import config, intent, matching, mock_whatsapp, parser, stt, tts, workflow
+
+app.include_router(mock_whatsapp.router)   # right after app = FastAPI(...)
+
+
+@app.post("/orders/{order_id}/send-whatsapp")
+def send_whatsapp(order_id: str, db: Session = Depends(get_db)):
+    order = get_order_or_404(db, order_id)
+    try:
+        resp = workflow.send_to_webhook(db, order, config.WHATSAPP_WEBHOOK_URL)
+    except workflow.WebhookError as e:
+        raise HTTPException(502, {"message": "Webhook unreachable", "error": str(e)})
+    return {"order_id": order.id, "status": order.status,
+            "webhook_url": config.WHATSAPP_WEBHOOK_URL, "webhook_response": resp}
+
+def stock_dict(i: StockItem) -> dict:
+    return {"item": i.name, "quantity": float(i.quantity), "unit": i.unit,
+            "supplier": i.supplier.name if i.supplier else None,
+            "reorder_qty": float(i.reorder_qty), "unit_cost": float(i.unit_cost),
+            "low": float(i.quantity) < config.REORDER_THRESHOLD}
+
+
+@app.post("/customer-order")   # sync on purpose: the reorder posts to the webhook
+def customer_order(req: CustomerOrderRequest, db: Session = Depends(get_db)):
+    if req.quantity <= 0:
+        raise HTTPException(422, {"message": "Quantity must be positive."})
+    try:
+        sale, item, reorder = inventory.record_sale(db, req.item, req.quantity, req.customer)
+    except inventory.StockError as e:
+        raise HTTPException(e.status, {"message": str(e)})
+    return {"sale_id": sale.id, "item": item.name, "sold": float(sale.quantity),
+            "stock_after": float(item.quantity), "reorder_triggered": reorder is not None,
+            "reorder": reorder}
+
+
+@app.get("/stock")
+def list_stock(db: Session = Depends(get_db)):
+    return [stock_dict(i) for i in db.query(StockItem).order_by(StockItem.name).all()]
+
+
+@app.post("/stock")
+def upsert_stock(req: StockUpsert, db: Session = Depends(get_db)):
+    item = inventory.find_item(db, req.item) or StockItem(name=req.item.strip(), aliases=[])
+    item.quantity = req.quantity
+    if req.unit: item.unit = req.unit
+    if req.reorder_qty is not None: item.reorder_qty = req.reorder_qty
+    if req.unit_cost is not None: item.unit_cost = req.unit_cost
+    if req.supplier:
+        sid, score = matching.match_supplier(req.supplier, [(s.id, s.name, s.aliases) for s in db.query(Supplier).all()])
+        if sid is None or score < config.MATCH_REJECT:
+            raise HTTPException(422, {"message": f"Supplier '{req.supplier}' not recognised."})
+        item.supplier_id = sid
+    db.add(item)
+    db.commit()
+    return stock_dict(item)

@@ -54,3 +54,28 @@ class LedgerEntry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     supplier: Mapped[Supplier] = relationship()
+
+class StockItem(Base):
+    __tablename__ = "stock_items"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True)
+    aliases: Mapped[list] = mapped_column(JSON, default=list)
+    quantity: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), nullable=True)
+    reorder_qty: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    unit_cost: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+
+    supplier: Mapped[Supplier | None] = relationship()
+
+
+class CustomerOrder(Base):
+    __tablename__ = "customer_orders"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    customer: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    stock_item_id: Mapped[int] = mapped_column(ForeignKey("stock_items.id"))
+    item: Mapped[str] = mapped_column(String(200))
+    quantity: Mapped[float] = mapped_column(Numeric(12, 2))
+    stock_after: Mapped[float] = mapped_column(Numeric(12, 2))
+    reorder_order_id: Mapped[str | None] = mapped_column(ForeignKey("orders.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

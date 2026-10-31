@@ -42,6 +42,8 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:6px 8px;
 .send{width:100%;margin-top:10px;padding:10px 14px}
 .or{display:flex;align-items:center;gap:10px;color:var(--mute);font-size:14px;margin:14px 0 8px}
 .or::before,.or::after{content:"";flex:1;border-top:1px solid var(--line)}
+.rec{width:100%;padding:14px;font-size:18px;font-weight:600}
+.rec.on{background:var(--red);border-color:var(--red);color:#fff}
 /* listening indicator */
 .listen{display:flex;gap:10px;align-items:center;margin-top:10px;font-weight:600}
 .dot{flex:none;width:12px;height:12px;border-radius:50%;background:var(--line)}
@@ -56,18 +58,20 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:6px 8px;
 <main>
 <header>
   <h1>MunimAI</h1>
-  <p class="sub">Upload an order recording. MunimAI reads it back, then listens for your reply.</p>
+  <p class="sub">Speak your order or upload a recording. MunimAI reads it back, then listens for your reply.</p>
 </header>
 
 <section>
   <h2>1. Place an order</h2>
+  <button id="recGo" class="rec primary" type="button">🎙 Record order</button>
+  <div id="status" class="status" role="status" style="margin:8px 0"></div>
+  <div class="or">or upload a recording</div>
   <label class="drop" id="drop">
     <span class="drop-title" id="dropTitle">Choose an audio file</span>
     <span class="drop-hint" id="fileName">mp3, wav, m4a or ogg, up to 5 MB. Drop it here or click to browse.</span>
     <input type="file" id="file" accept="audio/*,.mp3,.wav,.m4a,.ogg,.webm">
   </label>
   <button id="fileGo" class="primary send" disabled>Upload and send</button>
-  <div id="status" class="status" role="status" style="margin-top:8px"></div>
   <div class="or">or type the order</div>
   <div class="row"><input type="text" id="typed" placeholder="Amul ke 50 packet, 1500 ka bill"><button id="typedGo">Send</button></div>
   <p id="transcript" class="sub"></p>
@@ -136,7 +140,7 @@ async function toWav(blob){
 }
 
 // Record one reply. Stops by itself ~1.3 s after you stop talking; gives up if nothing is heard.
-async function listenOnce(){
+async function listenOnce(ctl={}){
   const stream = await navigator.mediaDevices.getUserMedia({audio:true});   // throws if mic is blocked
   const ac = new AudioContext(); await ac.resume();
   const an = ac.createAnalyser(); an.fftSize = 1024;
@@ -147,6 +151,7 @@ async function listenOnce(){
   return new Promise(resolve => {
     let heard=false, lastVoice=0; const started=performance.now();
     const finish = () => { clearInterval(timer); if(rec.state!=='inactive') rec.stop(); };
+    ctl.stop = finish;
     rec.onstop = () => { stream.getTracks().forEach(t=>t.stop()); ac.close();
       resolve(heard ? new Blob(chunks,{type:rec.mimeType}) : null); };
     const timer = setInterval(() => {
@@ -154,9 +159,9 @@ async function listenOnce(){
       let s=0; for(const x of data) s+=x*x;
       const now=performance.now();
       if(Math.sqrt(s/data.length) > 0.02){ heard=true; lastVoice=now; }
-      if(heard && now-lastVoice>1300) finish();
+      if(heard && now-lastVoice>(ctl.idleMs||1300)) finish();
       else if(!heard && now-started>7000) finish();
-      else if(now-started>12000) finish();
+      else if(now-started>(ctl.maxMs||12000)) finish();
     }, 100);
     rec.start();
   });
@@ -280,6 +285,22 @@ $('fileGo').onclick = () => {
   if(!file){ say('Choose an audio file first.', true); return; }
   if(file.size > 5*1024*1024){ say('File is over 5 MB. Choose a shorter recording.', true); return; }
   const f = new FormData(); f.append('audio', file, file.name); submitOrder(f);
+};
+// ---------- record the order with the mic ----------
+let recCtl = null;
+function setRecUI(on){ const b=$('recGo'); b.textContent = on ? '⏹ Stop' : '🎙 Record order'; b.classList.toggle('on', on); b.classList.toggle('primary', !on); }
+$('recGo').onclick = async () => {
+  if(recCtl){ recCtl.stop(); return; }                 // second click = stop recording
+  if(listening){ say('Already listening for your reply. Answer that first.', true); return; }
+  if('speechSynthesis' in window) speechSynthesis.cancel();
+  recCtl = {idleMs:1800, maxMs:20000}; listening = true; setRecUI(true);
+  say('Listening… speak your order. It stops when you pause, or click Stop.');
+  let blob = null;
+  try{ blob = await listenOnce(recCtl); }
+  catch(e){ recCtl=null; listening=false; setRecUI(false); say('Microphone not available. Allow mic access and try again.', true); return; }
+  recCtl=null; listening=false; setRecUI(false);
+  if(!blob){ say("Didn't hear anything. Click Record order and try again.", true); return; }
+  const f = new FormData(); f.append('audio', await toWav(blob), 'order.wav'); submitOrder(f);
 };
 $('typedGo').onclick = () => { const t=$('typed').value.trim(); if(!t) return; const f=new FormData(); f.append('text',t); submitOrder(f); };
 loadLedger();

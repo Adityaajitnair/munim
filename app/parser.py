@@ -51,27 +51,34 @@ def _extract_json(content: str) -> dict:
         raise ParseError(f"Invalid JSON from LLM: {e}") from e
 
 
-def _call_llm(prompt: str) -> dict:
+def _call_llm(prompt: str, retries: int = 1) -> dict:
     if not config.SARVAM_API_KEY:
         raise LLMError("SARVAM_API_KEY is not set")
-    try:
-        r = requests.post(
-            "https://api.sarvam.ai/v1/chat/completions",
-            headers={"api-subscription-key": config.SARVAM_API_KEY},
-            json={"model": config.LLM_MODEL, "messages": [{"role": "user", "content": prompt}]},
-            timeout=30,
-        )
-    except requests.RequestException as e:
-        raise LLMError(f"LLM request failed: {e}") from e
-    if r.status_code != 200:
-        raise LLMError(f"LLM returned {r.status_code}: {r.text[:200]}")
-    try:
-        content = r.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, ValueError) as e:
-        raise ParseError("Unexpected LLM response shape") from e
-    log.info("LLM raw reply: %r", content)
-    return _extract_json(content)
-
+    finish = None
+    for _ in range(retries + 1):
+        try:
+            r = requests.post(
+                "https://api.sarvam.ai/v1/chat/completions",
+                headers={"api-subscription-key": config.SARVAM_API_KEY},
+                json={"model": config.LLM_MODEL,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 2000},
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            raise LLMError(f"LLM request failed: {e}") from e
+        if r.status_code != 200:
+            raise LLMError(f"LLM returned {r.status_code}: {r.text[:200]}")
+        try:
+            choice = r.json()["choices"][0]
+        except (KeyError, IndexError, ValueError) as e:
+            raise ParseError("Unexpected LLM response shape") from e
+        content = (choice.get("message") or {}).get("content")
+        finish = choice.get("finish_reason")
+        log.info("LLM finish_reason=%s raw reply: %r", finish, content)
+        if isinstance(content, str) and content.strip():
+            return _extract_json(content)
+    raise ParseError(f"LLM returned empty content (finish_reason={finish})")
 
 def parse_order(text: str) -> ParsedOrder:
     data = _call_llm(ORDER_PROMPT + text)
