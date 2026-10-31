@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MunimAI demo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Mukta:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#eef3ee;--panel:#fbfdfb;--ink:#16211b;--mute:#5d6c63;--line:#c9d5cc;--green:#1d6b47;--saffron:#c46a12;--red:#a6322a;--wa:#dcf4d2}
+@media (prefers-color-scheme:dark){:root{--bg:#101612;--panel:#18211b;--ink:#e6efe8;--mute:#93a79a;--line:#2c3a31;--green:#4fbf86;--saffron:#e59a4a;--red:#e57a70;--wa:#24432a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 Mukta,system-ui,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:24px 16px 48px;display:grid;gap:16px;grid-template-columns:1fr 1fr}
+header{grid-column:1/-1}
+h1{margin:0;font-size:28px;font-weight:800}
+h2{margin:0 0 8px;font-size:17px;font-weight:600}
+.sub{color:var(--mute);margin:0}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+.wide{grid-column:1/-1}
+button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 14px}
+button:focus-visible,input:focus-visible{outline:3px solid var(--saffron);outline-offset:2px}
+button.primary{background:var(--green);color:#fff;border-color:var(--green);font-weight:600}
+button:disabled{opacity:.45;cursor:not-allowed}
+input[type=text]{width:100%;font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.status{font-weight:600}.err{color:var(--red)}
+.pill{display:inline-block;padding:1px 10px;border-radius:99px;border:1px solid var(--line);font-size:14px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;margin:8px 0}.kv span:nth-child(odd){color:var(--mute)}
+.soundbox{border:2px dashed var(--saffron);border-radius:10px;padding:12px}
+.wa{background:var(--wa);border-radius:10px;padding:10px 12px;white-space:pre-line;min-height:60px}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}td.n,th.n{text-align:right}
+/* upload zone */
+.drop{position:relative;display:flex;flex-direction:column;align-items:center;gap:4px;text-align:center;padding:26px 16px;border:2px dashed var(--line);border-radius:12px;background:var(--bg);cursor:pointer;transition:border-color .15s,background .15s}
+.drop:hover,.drop.over{border-color:var(--green);background:color-mix(in srgb,var(--green) 8%,var(--bg))}
+.drop:focus-within{outline:3px solid var(--saffron);outline-offset:2px}
+.drop input{position:absolute;width:1px;height:1px;opacity:0}
+.drop-title{font-weight:600;font-size:18px}
+.drop-hint{color:var(--mute);font-size:14px;word-break:break-all}
+.drop.has-file{border-style:solid;border-color:var(--green)}
+.drop.has-file .drop-title{color:var(--green)}
+.send{width:100%;margin-top:10px;padding:10px 14px}
+.or{display:flex;align-items:center;gap:10px;color:var(--mute);font-size:14px;margin:14px 0 8px}
+.or::before,.or::after{content:"";flex:1;border-top:1px solid var(--line)}
+/* listening indicator */
+.listen{display:flex;gap:10px;align-items:center;margin-top:10px;font-weight:600}
+.dot{flex:none;width:12px;height:12px;border-radius:50%;background:var(--line)}
+.listen.on .dot{background:var(--red);animation:pulse 1s infinite}
+.listen.bad{color:var(--red)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(166,50,42,.45)}100%{box-shadow:0 0 0 12px rgba(166,50,42,0)}}
+@media (prefers-reduced-motion:reduce){.listen.on .dot{animation:none}}
+@media (max-width:720px){main{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>MunimAI</h1>
+  <p class="sub">Upload an order recording. MunimAI reads it back, then listens for your reply.</p>
+</header>
+
+<section>
+  <h2>1. Place an order</h2>
+  <label class="drop" id="drop">
+    <span class="drop-title" id="dropTitle">Choose an audio file</span>
+    <span class="drop-hint" id="fileName">mp3, wav, m4a or ogg, up to 5 MB. Drop it here or click to browse.</span>
+    <input type="file" id="file" accept="audio/*,.mp3,.wav,.m4a,.ogg,.webm">
+  </label>
+  <button id="fileGo" class="primary send" disabled>Upload and send</button>
+  <div id="status" class="status" role="status" style="margin-top:8px"></div>
+  <div class="or">or type the order</div>
+  <div class="row"><input type="text" id="typed" placeholder="Amul ke 50 packet, 1500 ka bill"><button id="typedGo">Send</button></div>
+  <p id="transcript" class="sub"></p>
+</section>
+
+<section>
+  <h2>2. Your order</h2>
+  <div id="orderBox" class="sub">No order yet.</div>
+  <div id="listenState" class="listen" role="status"><span class="dot"></span><span id="listenText" class="sub">Waiting for an order.</span></div>
+  <p id="heard" class="sub" style="margin:6px 0 8px"></p>
+  <button id="listenAgain" disabled>Listen again</button>
+</section>
+
+<section>
+  <h2>Soundbox <span class="pill">simulated</span></h2>
+  <div class="soundbox"><div style="font-size:28px">🔊</div><div id="speaker" class="sub">Read-back will appear here.</div>
+    <button id="replay" disabled style="margin-top:10px">Play read-back again</button></div>
+</section>
+
+<section>
+  <h2>WhatsApp <span class="pill">mock view</span></h2>
+  <div id="wa" class="wa sub">Nothing sent yet.</div>
+</section>
+
+<section class="wide">
+  <h2>Ledger</h2>
+  <table><thead><tr><th>Supplier</th><th>Item</th><th class="n">Qty</th><th class="n">Amount (₹)</th></tr></thead><tbody id="ledger"></tbody></table>
+  <p id="grand" class="status"></p>
+</section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let orderId = null, status = null, listening = false, retries = 0;
+
+function say(msg, isErr){ const s=$('status'); s.textContent=msg; s.className='status'+(isErr?' err':''); }
+function setListen(msg, on, bad){
+  $('listenText').textContent = msg;
+  $('listenState').className = 'listen'+(on?' on':'')+(bad?' bad':'');
+}
+function errText(d){ const x=d&&d.detail; return typeof x==='string'?x:(x&&x.message)||'Something went wrong'; }
+
+async function api(path, opts){
+  const r = await fetch(path, opts); let j=null; try{ j=await r.json(); }catch(e){}
+  if(!r.ok){ const e=new Error(errText(j)); e.body=j; e.status=r.status; throw e; }
+  return j;
+}
+
+// ---------- audio helpers ----------
+function encodeWav(buf){                       // AudioBuffer -> 16-bit mono WAV (Sarvam accepts WAV for sure)
+  const ch=buf.getChannelData(0), n=ch.length, sr=buf.sampleRate;
+  const ab=new ArrayBuffer(44+n*2), v=new DataView(ab);
+  const w=(o,s)=>{ for(let i=0;i<s.length;i++) v.setUint8(o+i,s.charCodeAt(i)); };
+  w(0,'RIFF'); v.setUint32(4,36+n*2,true); w(8,'WAVE'); w(12,'fmt '); v.setUint32(16,16,true);
+  v.setUint16(20,1,true); v.setUint16(22,1,true); v.setUint32(24,sr,true); v.setUint32(28,sr*2,true);
+  v.setUint16(32,2,true); v.setUint16(34,16,true); w(36,'data'); v.setUint32(40,n*2,true);
+  for(let i=0;i<n;i++){ const x=Math.max(-1,Math.min(1,ch[i])); v.setInt16(44+i*2, x<0?x*0x8000:x*0x7fff, true); }
+  return new Blob([ab],{type:'audio/wav'});
+}
+async function toWav(blob){
+  try{
+    let ac; try{ ac=new AudioContext({sampleRate:16000}); }catch(e){ ac=new AudioContext(); }
+    const buf = await ac.decodeAudioData(await blob.arrayBuffer()); ac.close();
+    return encodeWav(buf);
+  }catch(e){ return blob; }                    // fall back to the browser's own format
+}
+
+// Record one reply. Stops by itself ~1.3 s after you stop talking; gives up if nothing is heard.
+async function listenOnce(){
+  const stream = await navigator.mediaDevices.getUserMedia({audio:true});   // throws if mic is blocked
+  const ac = new AudioContext(); await ac.resume();
+  const an = ac.createAnalyser(); an.fftSize = 1024;
+  ac.createMediaStreamSource(stream).connect(an);
+  const data = new Float32Array(an.fftSize);
+  const rec = new MediaRecorder(stream), chunks = [];
+  rec.ondataavailable = e => chunks.push(e.data);
+  return new Promise(resolve => {
+    let heard=false, lastVoice=0; const started=performance.now();
+    const finish = () => { clearInterval(timer); if(rec.state!=='inactive') rec.stop(); };
+    rec.onstop = () => { stream.getTracks().forEach(t=>t.stop()); ac.close();
+      resolve(heard ? new Blob(chunks,{type:rec.mimeType}) : null); };
+    const timer = setInterval(() => {
+      an.getFloatTimeDomainData(data);
+      let s=0; for(const x of data) s+=x*x;
+      const now=performance.now();
+      if(Math.sqrt(s/data.length) > 0.02){ heard=true; lastVoice=now; }
+      if(heard && now-lastVoice>1300) finish();
+      else if(!heard && now-started>7000) finish();
+      else if(now-started>12000) finish();
+    }, 100);
+    rec.start();
+  });
+}
+
+// ---------- speaking (Sarvam TTS, falls back to browser voice) ----------
+let lastText=null, cache={text:null,url:null};
+function afterSpeak(){ if(status==='PENDING_CONFIRMATION') startListening(); }
+async function speak(text){
+  lastText=text; $('speaker').textContent=text; $('replay').disabled=false;
+  if('speechSynthesis' in window) speechSynthesis.cancel();
+  try{
+    if(cache.text!==text){
+      const r = await fetch('/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,language:'hi-IN'})});
+      if(!r.ok) throw 0;
+      cache={text, url:URL.createObjectURL(await r.blob())};
+    }
+    const a = new Audio(cache.url); a.onended = afterSpeak; a.onerror = afterSpeak;
+    await a.play();
+  }catch(e){
+    if('speechSynthesis' in window){ const u=new SpeechSynthesisUtterance(text); u.lang='hi-IN'; u.onend=afterSpeak; u.onerror=afterSpeak; speechSynthesis.speak(u); }
+    else afterSpeak();
+  }
+}
+$('replay').onclick = () => { if(lastText && !listening) speak(lastText); };
+
+// ---------- order display ----------
+function showOrder(o){
+  orderId = o.order_id; status = o.status;
+  const box=$('orderBox'); box.className=''; box.innerHTML='';
+  const st=document.createElement('span'); st.className='pill'; st.textContent=o.status; box.append(st);
+  const kv=document.createElement('div'); kv.className='kv';
+  [['Supplier',o.supplier],['Item',o.item],['Quantity',o.quantity+(o.unit?' '+o.unit:'')],['Total','₹'+o.total]].forEach(([k,v])=>{
+    const a=document.createElement('span'); a.textContent=k; const b=document.createElement('span'); b.textContent=v; kv.append(a,b); });
+  box.append(kv);
+  $('listenAgain').disabled = listening || status!=='PENDING_CONFIRMATION';
+}
+
+// ---------- 1. place the order ----------
+async function submitOrder(form){
+  say('Understanding…'); $('heard').textContent=''; retries=0;
+  try{
+    const o = await api('/voice',{method:'POST',body:form});
+    $('transcript').textContent = 'Heard: '+o.transcript;
+    showOrder(o); say(''); speak(o.readback_text);
+  }catch(e){
+    if(e.body&&e.body.detail&&e.body.detail.transcript) $('transcript').textContent='Heard: '+e.body.detail.transcript;
+    say(e.message,true);
+  }
+}
+
+// ---------- 2. listen for the reply ----------
+async function startListening(){
+  if(listening || !orderId || status!=='PENDING_CONFIRMATION') return;
+  listening=true; $('listenAgain').disabled=true; $('replay').disabled=true;
+  setListen('Listening… say haan, nahi, or what to change.', true);
+  let blob=null;
+  try{ blob = await listenOnce(); }
+  catch(e){ listening=false; $('replay').disabled=false; $('listenAgain').disabled=false;
+    setListen('Microphone not available. Allow mic access, then click Listen again.', false, true); return; }
+  listening=false; $('replay').disabled=false;
+  if(!blob){ $('listenAgain').disabled=false; setListen("Didn't hear anything. Click Listen again.", false, true); return; }
+  setListen('Understanding your reply…', false);
+  const f=new FormData(); f.append('order_id',orderId); f.append('audio', await toWav(blob), 'reply.wav');
+  await sendReply(f);
+}
+
+async function sendReply(f){
+  try{
+    const r = await api('/confirm',{method:'POST',body:f});
+    retries=0;
+    if(r.transcript) $('heard').textContent='You said: '+r.transcript;
+    if(r.action==='modify'){
+      showOrder(r.order); setListen('Order updated. Reading it back…'); speak(r.order.readback_text);
+    }else if(r.action==='reject'){
+      setListen('Order cancelled.'); showOrder(await api('/orders/'+orderId));
+    }else{
+      setListen('Confirmed. Sending…'); await poll(); await loadLedger();
+    }
+  }catch(e){
+    const t=e.body&&e.body.detail&&e.body.detail.transcript; if(t) $('heard').textContent='You said: '+t;
+    if(e.status===422 && retries<2){ retries++; setListen(e.message+' Listening again…', false, true); setTimeout(startListening,1200); }
+    else{ setListen(e.message, false, true); $('listenAgain').disabled = status!=='PENDING_CONFIRMATION'; }
+  }
+}
+$('listenAgain').onclick = () => { retries=0; startListening(); };
+
+async function poll(){
+  for(let i=0;i<15;i++){
+    const o = await api('/orders/'+orderId); showOrder(o);
+    if(o.whatsapp_message && o.status==='EXECUTED'){ $('wa').textContent=o.whatsapp_message; setListen('Order sent.'); return; }
+    if(o.status==='FAILED'){ setListen('Send failed: '+(o.error||''), false, true); return; }
+    if(o.status==='CANCELLED') return;
+    await new Promise(r=>setTimeout(r,1000));
+  }
+  setListen('Still waiting for n8n. Check the workflow.', false, true);
+}
+
+async function loadLedger(){
+  const l = await api('/ledger'); const tb=$('ledger'); tb.innerHTML='';
+  l.entries.forEach(e=>{ const tr=document.createElement('tr');
+    [e.supplier,e.item,e.quantity+(e.unit?' '+e.unit:''),e.amount.toLocaleString('en-IN')].forEach((v,i)=>{ const td=document.createElement('td'); if(i>=2) td.className='n'; td.textContent=v; tr.append(td); });
+    tb.append(tr); });
+  $('grand').textContent = l.entries.length ? 'Total: ₹'+l.grand_total.toLocaleString('en-IN') : 'No entries yet.';
+}
+
+// ---------- upload zone ----------
+function pickFile(file){
+  const drop=$('drop');
+  if(!file){ drop.classList.remove('has-file'); $('dropTitle').textContent='Choose an audio file';
+    $('fileName').textContent='mp3, wav, m4a or ogg, up to 5 MB. Drop it here or click to browse.'; $('fileGo').disabled=true; return; }
+  drop.classList.add('has-file'); $('dropTitle').textContent='Ready to send';
+  $('fileName').textContent=file.name+' ('+(file.size/1024/1024).toFixed(2)+' MB)'; $('fileGo').disabled=false;
+}
+$('file').addEventListener('change', () => pickFile($('file').files[0]));
+['dragenter','dragover'].forEach(ev=>$('drop').addEventListener(ev,e=>{ e.preventDefault(); $('drop').classList.add('over'); }));
+['dragleave','drop'].forEach(ev=>$('drop').addEventListener(ev,e=>{ e.preventDefault(); $('drop').classList.remove('over'); }));
+$('drop').addEventListener('drop', e => { if(e.dataTransfer.files.length){ $('file').files=e.dataTransfer.files; pickFile($('file').files[0]); } });
+$('fileGo').onclick = () => {
+  const file = $('file').files[0];
+  if(!file){ say('Choose an audio file first.', true); return; }
+  if(file.size > 5*1024*1024){ say('File is over 5 MB. Choose a shorter recording.', true); return; }
+  const f = new FormData(); f.append('audio', file, file.name); submitOrder(f);
+};
+$('typedGo').onclick = () => { const t=$('typed').value.trim(); if(!t) return; const f=new FormData(); f.append('text',t); submitOrder(f); };
+loadLedger();
+</script>
+</body>
+</html>
