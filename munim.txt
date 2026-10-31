@@ -1,0 +1,66 @@
+I read your new MunimAI deck. The best way to start is a thin end-to-end version first (a "walking skeleton"), then improve each part. Don't perfect any one piece before the whole flow works.
+
+## Step 0: Decide the minimum demo
+
+For the hackathon, build one golden path that works every time:
+
+> Merchant speaks in Hindi → transcript → structured order → read-back for confirmation → merchant says "haan" → WhatsApp PO goes out + ledger updates
+
+**Cut or fake for now:**
+- **Real Paytm and Soundbox integration.** You probably won't get API access in time. Simulate the Soundbox with a speaker icon and text-to-speech in your web demo, and label it "simulated" on the slide.
+- **More than Hindi plus one other language.**
+- **Login, multi-merchant support, inventory forecasting.**
+
+## Step 1: Set up accounts and tools (about half a day)
+
+- **Sarvam AI:** API key from their dashboard. Check their docs for current model names, since they change.
+- **Python 3.11 + FastAPI** in a virtual environment.
+- **Postgres:** Docker locally, or Supabase for a free hosted one.
+- **n8n:** run it with Docker or use n8n Cloud's trial.
+- **WhatsApp:** use the Twilio WhatsApp sandbox or Meta's test number for the demo. A real WhatsApp Business account needs approvals that can take days.
+
+## Step 2: Build in this order
+
+1. **Voice to text.** Write a small script that sends a recorded audio file to Sarvam's speech-to-text. Test 10 to 15 sentences in Hinglish ("Amul ke 50 packet, 1500 ka bill") and note the accuracy and latency. This is your biggest technical risk, so test it first .	
+2. **Text to structured JSON.** Add an LLM step with a strict prompt and schema (intent, supplier, item, quantity, total). Validate with Pydantic. Match supplier names against a supplier table, because speech-to-text will often mangle them.
+3. **FastAPI core.** Build `POST /voice` (receives audio, returns the parsed order) and `POST /confirm`. Store each order with a status: `PENDING_CONFIRMATION` → `CONFIRMED` → `EXECUTED`. This state machine makes your confirmation safety claim real.
+4. **n8n workflow.** Trigger it via webhook when an order is confirmed. Send the WhatsApp message, then call back to FastAPI to mark the order executed. Add one retry path.
+5. **Voice confirmation.** Use text-to-speech to read back "50 Amul milk, ₹1,500. Confirm?" (Sarvam has a TTS model; check the docs). Run the "haan" reply back through step 1.
+6. **Demo interface.** A simple web page with a mic button (browser audio recording), a live ledger table, a simulated Soundbox, and a mock WhatsApp view. Streamlit is fastest, or plain HTML.
+
+## Step 3: Suggested repo structure
+
+```
+munimai/
+├── app/
+│   ├── main.py          # FastAPI app and routes
+│   ├── stt.py           # Sarvam speech-to-text
+│   ├── parser.py        # LLM intent to JSON (Pydantic models)
+│   ├── tts.py           # voice read-back
+│   ├── models.py        # DB tables
+│   └── workflow.py      # order state machine, n8n webhook calls
+├── n8n/                 # exported workflow JSON
+├── frontend/            # demo page
+├── tests/               # Hinglish sample sentences
+├── docker-compose.yml   # postgres + n8n
+└── .env                 # API keys (never commit this)
+```
+
+## Step 4: Make your deck's claims true
+
+Your slides mention "420ms latency," "20-second confirmations," and "10+ languages." Once the prototype runs, **measure real numbers** and update the slides. Real measured latency, even if slower, is more credible than an unexplained number. Also mark anything simulated (Paytm API, Soundbox) honestly.
+
+## Biggest risks
+
+- **Hinglish accuracy.** Test early and keep a "didn't catch that, please repeat" fallback.
+- **WhatsApp approvals.** Use the sandbox and don't depend on the real API.
+- **Time.** Finish the golden path before adding features. Record a backup demo video in case live voice fails on stage.
+
+## If you're a team of 3 to 4
+
+- **One person:** voice, parsing and LLM (steps 1 and 2)
+- **One person:** FastAPI and database (step 3)
+- **One person:** n8n, WhatsApp and TTS (steps 4 and 5)
+- **One person:** demo interface, deck updates and demo script
+
+Tell me your deadline and team size, and I'll turn this into a day-by-day schedule. I can also scaffold the repo with the FastAPI skeleton, the Pydantic order models and the docker-compose file so you can start coding right away.
