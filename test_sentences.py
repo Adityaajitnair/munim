@@ -120,12 +120,44 @@ def run_case(case: dict) -> dict:
     return {"ok": ok, "why": why, "secs": dt, "state": state, "case": case}
 
 
+def save_json(results: list[dict]) -> None:
+    """Write a machine-readable report the dashboard reads at GET /metrics."""
+    import datetime
+
+    out = Path("bench")
+    out.mkdir(exist_ok=True)
+    report = {
+        "run_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "summary": {
+            "cases": len(results),
+            "passed": sum(1 for r in results if r["ok"]),
+            "avg_latency": sum(r["secs"] for r in results) / len(results),
+            "orders_filled": sum(1 for r in results if r["state"].get("final_order")),
+        },
+        "cases": [
+            {
+                "file": r["case"]["file"],
+                "ok": r["ok"],
+                "secs": round(r["secs"], 2),
+                "transcript": r["state"]["transcript"],
+                "verdict": r["why"],
+            }
+            for r in results
+        ],
+    }
+    (out / "results.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(f"(report saved to {out / 'results.json'} - the live /dashboard reads this)")
+
+
 # ---------------------------------------------------------------------------
 # Pretty report
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     results = [run_case(c) for c in CASES]
+    save_json(results)   # also save bench/results.json for the /dashboard
 
     print()
     print("=" * 78)

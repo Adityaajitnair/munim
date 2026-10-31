@@ -1,0 +1,53 @@
+{
+  "run_at": "2026-10-31T12:00:07",
+  "summary": {
+    "cases": 6,
+    "passed": 6,
+    "avg_latency": 1.1371153833315475,
+    "orders_filled": 3
+  },
+  "cases": [
+    {
+      "file": "t1_no_item_amul.mp3",
+      "ok": true,
+      "secs": 2.27,
+      "transcript": "Amul's 25 packets, bill of 1000.",
+      "verdict": "order filled cleanly"
+    },
+    {
+      "file": "t2_unknown_brand.mp3",
+      "ok": true,
+      "secs": 0.86,
+      "transcript": "Twelve out of twelve packets, bill of four hundred eighty.",
+      "verdict": "asked: \"What item (and supplier) did you order?\""
+    },
+    {
+      "file": "t3_full_order.mp3",
+      "ok": true,
+      "secs": 1.04,
+      "transcript": "Amul milk 30 liters, total 900.",
+      "verdict": "order filled cleanly"
+    },
+    {
+      "file": "t4_no_supplier.mp3",
+      "ok": true,
+      "secs": 0.89,
+      "transcript": "Give me fifty packets of milk bill for one thousand five hundred, brother.",
+      "verdict": "asked: \"milk noted. Which supplier (distributor) is this for?\""
+    },
+    {
+      "file": "t5_english_mix.mp3",
+      "ok": true,
+      "secs": 0.95,
+      "transcript": "Carly G's 10 cartons amount to ₹250.",
+      "verdict": "order filled cleanly"
+    },
+    {
+      "file": "t6_mumble.mp3",
+      "ok": true,
+      "secs": 0.81,
+      "transcript": "Milk is thirty liters, total is nine hundred rupees.",
+      "verdict": "clarified: \"milk noted. Which supplier (distributor) is this for?\""
+    }
+  ]
+}
