@@ -4,13 +4,14 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi.concurrency import run_in_threadpool
+
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
-from . import config, intent, matching, parser, stt, tts, workflow
+from . import config, intent, matching, mock_whatsapp, parser, stock, stt, tts, workflow
 from .db import Base, SessionLocal, engine, get_db
 from .models import LedgerEntry, Order, Supplier
 from .schemas import ExecutedCallback, TTSRequest
@@ -21,16 +22,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("munimai")
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
-from . import config, intent, inventory, matching, mock_whatsapp, parser, stt, tts, workflow
-from .models import CustomerOrder, LedgerEntry, Order, StockItem, Supplier
-from .schemas import CustomerOrderRequest, ExecutedCallback, StockUpsert, TTSRequest
-
-SEED_STOCK = [  # name, aliases, qty, unit, supplier, reorder_qty, unit_cost
-    ("Amul Milk", ["milk", "doodh", "अमूल दूध"], 20, "packet", "Amul", 50, 30),
-    ("Parle-G", ["parle g", "पारले जी"], 30, "packet", "Parle", 100, 8),
-    ("Good Day Biscuits", ["good day", "gud day"], 18, "packet", "Britannia", 60, 20),
-    ("Aloo Bhujia", ["bhujia", "haldiram bhujia"], 25, "packet", "Haldiram", 40, 45),
-]
 
 SEED_SUPPLIERS = [
     ("Amul", ["अमूल", "amool", "amul dairy"]),
@@ -40,6 +31,12 @@ SEED_SUPPLIERS = [
     ("Haldiram", ["हल्दीराम", "haldiram's"]),
 ]
 DEMO_WHATSAPP = "+910000000000"  # replace with your sandbox-joined number
+
+# Starting stock, added when the ledger is empty: supplier, item, unit, quantity, amount (Rs)
+SEED_LEDGER = [
+    ("Britannia", "Biscuit", None, 30, 2000),
+    ("Amul", "milk", "liter", 75, 2700),
+]
 
 
 @asynccontextmanager
@@ -52,15 +49,17 @@ async def lifespan(app: FastAPI):
                 db.add(Supplier(name=name, aliases=aliases, whatsapp_number=DEMO_WHATSAPP))
         db.commit()
 
-        if db.query(StockItem).count() == 0:
+        if db.query(LedgerEntry).count() == 0:
             sup = {s.name: s.id for s in db.query(Supplier).all()}
-            for name, aliases, qty, unit, sname, rq, cost in SEED_STOCK:
-                db.add(StockItem(name=name, aliases=aliases, quantity=qty, unit=unit,
-                                 supplier_id=sup.get(sname), reorder_qty=rq, unit_cost=cost))
+            for sname, item, unit, qty, amount in SEED_LEDGER:
+                db.add(LedgerEntry(supplier_id=sup[sname], item=item, unit=unit,
+                                   quantity=qty, unit_cost=amount / qty))
             db.commit()
     yield
 
+
 app = FastAPI(title="MunimAI", version="0.1", lifespan=lifespan)
+app.include_router(mock_whatsapp.router)
 
 
 @app.exception_handler(IllegalTransition)
@@ -73,6 +72,7 @@ async def _illegal(_, exc: IllegalTransition):
 def order_dict(o: Order) -> dict:
     return {
         "order_id": o.id,
+        "kind": o.kind,
         "status": o.status,
         "transcript": o.transcript,
         "language": o.language,
@@ -206,7 +206,8 @@ async def confirm(order_id: str = Form(...), decision: str | None = Form(None),
                   audio: UploadFile | None = File(None), text: str | None = Form(None),
                   db: Session = Depends(get_db)):
     """Resolve a pending order. Either an explicit decision (confirm/reject), or the merchant's
-    spoken/typed reply, which Sarvam interprets: confirm, reject, or a correction."""
+    spoken/typed reply, which Sarvam interprets: confirm, reject, or a correction.
+    Confirming a customer order updates the stock ledger (and may send a restock PO to WhatsApp)."""
     order = get_order_or_404(db, order_id)
     heard, changes = None, {}
 
@@ -238,12 +239,21 @@ async def confirm(order_id: str = Form(...), decision: str | None = Form(None),
                 "transcript": heard, "order": order_dict(order)}
 
     try:
+        if order.status == OrderStatus.PENDING_CONFIRMATION.value and order.kind == "CUSTOMER":
+            stock.check_fulfillable(db, order)  # refuse before confirming if the ledger can't fill it
         moved = workflow.confirm_order(db, order)
+    except stock.LedgerError as e:
+        raise HTTPException(409, {"message": str(e), "transcript": heard})
     except workflow.NotConfirmable as e:
         raise HTTPException(422, {"message": str(e)})
-    dispatch = await run_in_threadpool(workflow.dispatch_order, db, order) if moved else "already_confirmed"
-    return {"order_id": order.id, "status": order.status, "action": "confirm", "dispatch": dispatch,
-            "whatsapp_message": order.whatsapp_message, "transcript": heard}
+
+    result = None
+    if moved and order.kind == "CUSTOMER":
+        result = await run_in_threadpool(stock.apply_customer_order, db, order)  # may POST the restock webhook
+    restock = result["restock"] if result else None
+    return {"order_id": order.id, "status": order.status, "action": "confirm", "transcript": heard,
+            "ledger": result, "restock": restock,
+            "whatsapp_message": restock.get("whatsapp_message") if restock else None}
 
 
 @app.post("/orders/{order_id}/executed")
@@ -262,57 +272,9 @@ def retry(order_id: str, db: Session = Depends(get_db)):
     return {"order_id": order.id, "dispatch": workflow.dispatch_order(db, order), "status": order.status}
 
 
-@app.get("/orders/{order_id}")
-def get_order(order_id: str, db: Session = Depends(get_db)):
-    return order_dict(get_order_or_404(db, order_id))
-
-
-@app.get("/orders")
-def list_orders(status: str | None = None, limit: int = 20, db: Session = Depends(get_db)):
-    q = db.query(Order)
-    if status:
-        q = q.filter(Order.status == status)
-    return [order_dict(o) for o in q.order_by(Order.created_at.desc()).limit(min(limit, 100)).all()]
-
-
-@app.get("/ledger")
-def ledger(db: Session = Depends(get_db)):
-    rows = db.query(LedgerEntry).order_by(LedgerEntry.created_at.desc()).all()
-    totals: dict[str, float] = {}
-    merged: dict[tuple, dict] = {}   # one row per supplier + item + unit
-    for r in rows:                   # newest first, so the first row seen sets the label/time
-        o = db.get(Order, r.order_id)
-        amount = float(r.amount)
-        totals[r.supplier.name] = totals.get(r.supplier.name, 0) + amount
-        key = (r.supplier.name, matching.normalize(o.item), (o.unit or "").lower())
-        e = merged.get(key)
-        if e is None:
-            merged[key] = {"id": r.id, "order_id": r.order_id, "order_ids": [r.order_id],
-                           "supplier": r.supplier.name, "item": o.item,
-                           "quantity": float(o.quantity), "unit": o.unit,
-                           "amount": amount, "created_at": r.created_at.isoformat()}
-        else:
-            e["quantity"] = round(e["quantity"] + float(o.quantity), 2)
-            e["amount"] = round(e["amount"] + amount, 2)
-            e["order_ids"].append(r.order_id)
-    return {"entries": list(merged.values()), "totals_by_supplier": totals,
-            "grand_total": sum(totals.values())}
-
-@app.post("/tts")
-def text_to_speech(req: TTSRequest):
-    try:
-        audio = tts.synthesize(req.text, req.language)
-    except tts.TTSError as e:
-        raise HTTPException(503, {"message": "TTS unavailable", "error": str(e)})
-    return Response(content=audio, media_type="audio/wav")
-
-from . import config, intent, matching, mock_whatsapp, parser, stt, tts, workflow
-
-app.include_router(mock_whatsapp.router)   # right after app = FastAPI(...)
-
-
 @app.post("/orders/{order_id}/send-whatsapp")
 def send_whatsapp(order_id: str, db: Session = Depends(get_db)):
+    """Manually (re)send a CONFIRMED order's details to the WhatsApp webhook."""
     order = get_order_or_404(db, order_id)
     try:
         resp = workflow.send_to_webhook(db, order, config.WHATSAPP_WEBHOOK_URL)
@@ -321,43 +283,43 @@ def send_whatsapp(order_id: str, db: Session = Depends(get_db)):
     return {"order_id": order.id, "status": order.status,
             "webhook_url": config.WHATSAPP_WEBHOOK_URL, "webhook_response": resp}
 
-def stock_dict(i: StockItem) -> dict:
-    return {"item": i.name, "quantity": float(i.quantity), "unit": i.unit,
-            "supplier": i.supplier.name if i.supplier else None,
-            "reorder_qty": float(i.reorder_qty), "unit_cost": float(i.unit_cost),
-            "low": float(i.quantity) < config.REORDER_THRESHOLD}
+
+@app.get("/orders/{order_id}")
+def get_order(order_id: str, db: Session = Depends(get_db)):
+    return order_dict(get_order_or_404(db, order_id))
 
 
-@app.post("/customer-order")   # sync on purpose: the reorder posts to the webhook
-def customer_order(req: CustomerOrderRequest, db: Session = Depends(get_db)):
-    if req.quantity <= 0:
-        raise HTTPException(422, {"message": "Quantity must be positive."})
+@app.get("/orders")
+def list_orders(status: str | None = None, kind: str | None = None, limit: int = 20,
+                db: Session = Depends(get_db)):
+    q = db.query(Order)
+    if status:
+        q = q.filter(Order.status == status)
+    if kind:
+        q = q.filter(Order.kind == kind.upper())
+    return [order_dict(o) for o in q.order_by(Order.created_at.desc()).limit(min(limit, 100)).all()]
+
+
+@app.get("/ledger")
+def ledger(db: Session = Depends(get_db)):
+    """The stock ledger: one row per supplier + item."""
+    rows = db.query(LedgerEntry).order_by(LedgerEntry.id).all()
+    totals: dict[str, float] = {}
+    entries = []
+    for r in rows:
+        totals[r.supplier.name] = round(totals.get(r.supplier.name, 0) + r.amount, 2)
+        entries.append({"id": r.id, "supplier": r.supplier.name, "item": r.item,
+                        "quantity": round(float(r.quantity), 2), "unit": r.unit,
+                        "unit_cost": round(float(r.unit_cost), 2), "amount": r.amount,
+                        "low": float(r.quantity) < config.REORDER_THRESHOLD})
+    return {"entries": entries, "totals_by_supplier": totals, "grand_total": round(sum(totals.values()), 2),
+            "reorder_threshold": config.REORDER_THRESHOLD, "restock_qty": config.RESTOCK_QTY}
+
+
+@app.post("/tts")
+def text_to_speech(req: TTSRequest):
     try:
-        sale, item, reorder = inventory.record_sale(db, req.item, req.quantity, req.customer)
-    except inventory.StockError as e:
-        raise HTTPException(e.status, {"message": str(e)})
-    return {"sale_id": sale.id, "item": item.name, "sold": float(sale.quantity),
-            "stock_after": float(item.quantity), "reorder_triggered": reorder is not None,
-            "reorder": reorder}
-
-
-@app.get("/stock")
-def list_stock(db: Session = Depends(get_db)):
-    return [stock_dict(i) for i in db.query(StockItem).order_by(StockItem.name).all()]
-
-
-@app.post("/stock")
-def upsert_stock(req: StockUpsert, db: Session = Depends(get_db)):
-    item = inventory.find_item(db, req.item) or StockItem(name=req.item.strip(), aliases=[])
-    item.quantity = req.quantity
-    if req.unit: item.unit = req.unit
-    if req.reorder_qty is not None: item.reorder_qty = req.reorder_qty
-    if req.unit_cost is not None: item.unit_cost = req.unit_cost
-    if req.supplier:
-        sid, score = matching.match_supplier(req.supplier, [(s.id, s.name, s.aliases) for s in db.query(Supplier).all()])
-        if sid is None or score < config.MATCH_REJECT:
-            raise HTTPException(422, {"message": f"Supplier '{req.supplier}' not recognised."})
-        item.supplier_id = sid
-    db.add(item)
-    db.commit()
-    return stock_dict(item)
+        audio = tts.synthesize(req.text, req.language)
+    except tts.TTSError as e:
+        raise HTTPException(503, {"message": "TTS unavailable", "error": str(e)})
+    return Response(content=audio, media_type="audio/wav")

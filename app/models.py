@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -24,6 +24,8 @@ class Order(Base):
     __tablename__ = "orders"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     status: Mapped[str] = mapped_column(String(32), default=OrderStatus.PENDING_CONFIRMATION.value, index=True)
+    # CUSTOMER = spoken customer order (changes the ledger); RESTOCK = auto purchase order sent to WhatsApp
+    kind: Mapped[str] = mapped_column(String(16), default="CUSTOMER")
     transcript: Mapped[str] = mapped_column(Text)
     language: Mapped[str | None] = mapped_column(String(16), nullable=True)
     supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), nullable=True)
@@ -46,36 +48,20 @@ class Order(Base):
 
 
 class LedgerEntry(Base):
+    """Stock ledger: ONE row per supplier + item. Quantity moves with customer orders and restocks;
+    amount is the value of the stock on hand (quantity x unit_cost)."""
     __tablename__ = "ledger_entries"
+    __table_args__ = (UniqueConstraint("supplier_id", "item"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id"), unique=True)
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"))
-    amount: Mapped[float] = mapped_column(Numeric(12, 2))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    item: Mapped[str] = mapped_column(String(200))
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    quantity: Mapped[float] = mapped_column(Float, default=0.0)
+    unit_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
     supplier: Mapped[Supplier] = relationship()
 
-class StockItem(Base):
-    __tablename__ = "stock_items"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(200), unique=True)
-    aliases: Mapped[list] = mapped_column(JSON, default=list)
-    quantity: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
-    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), nullable=True)
-    reorder_qty: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
-    unit_cost: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
-
-    supplier: Mapped[Supplier | None] = relationship()
-
-
-class CustomerOrder(Base):
-    __tablename__ = "customer_orders"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    customer: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    stock_item_id: Mapped[int] = mapped_column(ForeignKey("stock_items.id"))
-    item: Mapped[str] = mapped_column(String(200))
-    quantity: Mapped[float] = mapped_column(Numeric(12, 2))
-    stock_after: Mapped[float] = mapped_column(Numeric(12, 2))
-    reorder_order_id: Mapped[str | None] = mapped_column(ForeignKey("orders.id"), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    @property
+    def amount(self) -> float:
+        return round(float(self.quantity) * float(self.unit_cost), 2)

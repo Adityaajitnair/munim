@@ -7,63 +7,18 @@ import requests
 from sqlalchemy.orm import Session
 
 from . import config
-from .models import LedgerEntry, Order, Supplier
+from .models import Order, Supplier
 from .states import IllegalTransition, OrderStatus, check_transition
 
 log = logging.getLogger("munimai.workflow")
 
-from . import config, matching          # add matching to the existing import
-from .models import LedgerEntry, Order, StockItem, Supplier   # add StockItem
-
-def _restock(db: Session, order: Order) -> None:
-    if not order.item or order.item == "items":
-        return
-    qty = float(order.quantity)
-    cost = round(float(order.total) / qty, 2) if qty else 0
-    items = db.query(StockItem).all()
-    sid, score = matching.match_supplier(order.item, [(i.id, i.name, i.aliases) for i in items])
-    if sid is not None and score >= config.MATCH_ACCEPT:
-        s = db.get(StockItem, sid)
-        s.quantity = float(s.quantity) + qty
-        s.unit_cost = cost
-        s.unit = s.unit or order.unit
-    else:
-        db.add(StockItem(name=order.item, aliases=[], quantity=qty, unit=order.unit,
-                         supplier_id=order.supplier_id, reorder_qty=qty, unit_cost=cost))
-
-class WebhookError(Exception):
-    """Webhook unreachable or returned an error status."""
-
-
-def _payload(order: Order) -> dict:
-    return {
-        "order_id": order.id,
-        "supplier": order.supplier.name,
-        "whatsapp_number": order.supplier.whatsapp_number,
-        "item": order.item,
-        "quantity": float(order.quantity),
-        "unit": order.unit,
-        "total": float(order.total),
-        "message": order.whatsapp_message,
-        "callback_url_path": f"/orders/{order.id}/executed",
-    }
-
-
-def send_to_webhook(db: Session, order: Order, url: str) -> dict:
-    """POST a CONFIRMED order's details to a webhook. Status stays CONFIRMED until the callback."""
-    if order.status != OrderStatus.CONFIRMED.value:
-        raise IllegalTransition("Only CONFIRMED orders can be sent")
-    try:
-        r = requests.post(url, json=_payload(order), timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except (requests.RequestException, ValueError) as e:
-        order.error = f"webhook failed: {e}"
-        db.commit()
-        raise WebhookError(str(e)) from e
 
 class NotConfirmable(Exception):
     """Order has no matched supplier, so it must not be sent."""
+
+
+class WebhookError(Exception):
+    """Webhook unreachable or returned an error status."""
 
 
 def _now():
@@ -100,9 +55,10 @@ def build_po_message(order: Order, supplier: Supplier) -> str:
 
 
 def create_order(db: Session, *, transcript: str, language, parsed, supplier: Supplier,
-                 score: float, stt_ms: int, parse_ms: int, did_you_mean: bool) -> Order:
+                 score: float, stt_ms: int, parse_ms: int, did_you_mean: bool,
+                 kind: str = "CUSTOMER") -> Order:
     order = Order(
-        status=OrderStatus.PENDING_CONFIRMATION.value,
+        status=OrderStatus.PENDING_CONFIRMATION.value, kind=kind,
         transcript=transcript, language=language, supplier_id=supplier.id,
         item=parsed.item or "items", quantity=parsed.quantity, unit=parsed.unit,
         total=parsed.total_amount, match_confidence=score,
@@ -144,7 +100,7 @@ def _set_status(order: Order, new: OrderStatus) -> None:
 
 
 def confirm_order(db: Session, order: Order) -> bool:
-    """Returns True if this call moved the order to CONFIRMED (caller should dispatch).
+    """Returns True if this call moved the order to CONFIRMED (caller should act on it).
     Idempotent: re-confirming a CONFIRMED/EXECUTED order returns False."""
     if order.status in (OrderStatus.CONFIRMED.value, OrderStatus.EXECUTED.value):
         return False
@@ -152,7 +108,8 @@ def confirm_order(db: Session, order: Order) -> bool:
         raise NotConfirmable("No matched supplier")
     _set_status(order, OrderStatus.CONFIRMED)
     order.confirmed_at = _now()
-    order.whatsapp_message = build_po_message(order, order.supplier)
+    if order.kind == "RESTOCK":  # only restock POs are sent to WhatsApp
+        order.whatsapp_message = build_po_message(order, order.supplier)
     db.commit()
     return True
 
@@ -171,13 +128,29 @@ def mark_executed(db: Session, order: Order, success: bool, message_id=None, err
         _set_status(order, OrderStatus.EXECUTED)
         order.executed_at = _now()
         order.whatsapp_message_id = message_id
-        db.add(LedgerEntry(order_id=order.id, supplier_id=order.supplier_id, amount=order.total))
     else:
         _set_status(order, OrderStatus.FAILED)
         order.error = error or "WhatsApp send failed"
     db.commit()
 
+
+def _payload(order: Order) -> dict:
+    return {
+        "order_id": order.id,
+        "supplier": order.supplier.name,
+        "whatsapp_number": order.supplier.whatsapp_number,
+        "item": order.item,
+        "quantity": float(order.quantity),
+        "unit": order.unit,
+        "total": float(order.total),
+        "message": order.whatsapp_message,
+        "callback_url_path": f"/orders/{order.id}/executed",
+    }
+
+
 def dispatch_order(db: Session, order: Order) -> str:
+    """Hand a CONFIRMED order to n8n, or to the WhatsApp webhook (the mock by default).
+    Returns 'n8n', 'mock_whatsapp', 'simulated' or 'n8n_failed' (order stays CONFIRMED; use /retry)."""
     if order.status != OrderStatus.CONFIRMED.value:
         raise IllegalTransition("Only CONFIRMED orders can be dispatched")
     url = config.N8N_WEBHOOK_URL or config.WHATSAPP_WEBHOOK_URL
@@ -185,9 +158,8 @@ def dispatch_order(db: Session, order: Order) -> str:
         mark_executed(db, order, True, message_id=f"SIM-{uuid.uuid4().hex[:8]}")
         log.info("order=%s simulated WhatsApp send", order.id)
         return "simulated"
-    payload = _payload(order)
     try:
-        r = requests.post(url, json=payload, timeout=5)
+        r = requests.post(url, json=_payload(order), timeout=5)
         r.raise_for_status()
         log.info("order=%s sent to %s", order.id, url)
         return "n8n" if config.N8N_WEBHOOK_URL else "mock_whatsapp"
@@ -196,3 +168,17 @@ def dispatch_order(db: Session, order: Order) -> str:
         order.error = f"webhook failed: {e}"
         db.commit()
         return "n8n_failed"
+
+
+def send_to_webhook(db: Session, order: Order, url: str) -> dict:
+    """POST a CONFIRMED order's details to a webhook. Status stays CONFIRMED until the callback."""
+    if order.status != OrderStatus.CONFIRMED.value:
+        raise IllegalTransition("Only CONFIRMED orders can be sent")
+    try:
+        r = requests.post(url, json=_payload(order), timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except (requests.RequestException, ValueError) as e:
+        order.error = f"webhook failed: {e}"
+        db.commit()
+        raise WebhookError(str(e)) from e

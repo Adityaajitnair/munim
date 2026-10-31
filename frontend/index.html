@@ -44,6 +44,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:6px 8px;
 .or::before,.or::after{content:"";flex:1;border-top:1px solid var(--line)}
 .rec{width:100%;padding:14px;font-size:18px;font-weight:600}
 .rec.on{background:var(--red);border-color:var(--red);color:#fff}
+tr.low td{color:var(--saffron);font-weight:600}
 /* listening indicator */
 .listen{display:flex;gap:10px;align-items:center;margin-top:10px;font-weight:600}
 .dot{flex:none;width:12px;height:12px;border-radius:50%;background:var(--line)}
@@ -97,8 +98,8 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:6px 8px;
 </section>
 
 <section class="wide">
-  <h2>Ledger</h2>
-  <table><thead><tr><th>Supplier</th><th>Item</th><th class="n">Qty</th><th class="n">Amount (₹)</th></tr></thead><tbody id="ledger"></tbody></table>
+  <h2>Stock ledger</h2>
+  <table><thead><tr><th>Supplier</th><th>Item</th><th class="n">Qty</th><th class="n">Value (₹)</th></tr></thead><tbody id="ledger"></tbody></table>
   <p id="grand" class="status"></p>
 </section>
 </main>
@@ -239,7 +240,15 @@ async function sendReply(f){
     }else if(r.action==='reject'){
       setListen('Order cancelled.'); showOrder(await api('/orders/'+orderId));
     }else{
-      setListen('Confirmed. Sending…'); await poll(); await loadLedger();
+      showOrder(await api('/orders/'+orderId));
+      const L=r.ledger, u=L&&L.unit?' '+L.unit:'';
+      if(L){
+        if(r.restock && r.restock.error){ $('wa').textContent='Restock failed: '+r.restock.error; setListen(L.item+' restocked, but sending the PO failed.', false, true); }
+        else if(r.restock){ $('wa').textContent=r.restock.whatsapp_message||'Restock PO sent.';
+          setListen(L.item+' was low ('+L.before+u+'). Added '+L.restocked+', PO sent to WhatsApp. Stock now '+L.after+u+'.'); }
+        else { $('wa').textContent='No restock needed.'; setListen('Order done. '+L.item+' stock: '+L.before+u+' → '+L.after+u+'.'); }
+      }else setListen('Order was already confirmed.');
+      await loadLedger();
     }
   }catch(e){
     const t=e.body&&e.body.detail&&e.body.detail.transcript; if(t) $('heard').textContent='You said: '+t;
@@ -249,23 +258,12 @@ async function sendReply(f){
 }
 $('listenAgain').onclick = () => { retries=0; startListening(); };
 
-async function poll(){
-  for(let i=0;i<15;i++){
-    const o = await api('/orders/'+orderId); showOrder(o);
-    if(o.whatsapp_message && o.status==='EXECUTED'){ $('wa').textContent=o.whatsapp_message; setListen('Order sent.'); return; }
-    if(o.status==='FAILED'){ setListen('Send failed: '+(o.error||''), false, true); return; }
-    if(o.status==='CANCELLED') return;
-    await new Promise(r=>setTimeout(r,1000));
-  }
-  setListen('Still waiting for n8n. Check the workflow.', false, true);
-}
-
 async function loadLedger(){
   const l = await api('/ledger'); const tb=$('ledger'); tb.innerHTML='';
-  l.entries.forEach(e=>{ const tr=document.createElement('tr');
+  l.entries.forEach(e=>{ const tr=document.createElement('tr'); if(e.low) tr.className='low';
     [e.supplier,e.item,e.quantity+(e.unit?' '+e.unit:''),e.amount.toLocaleString('en-IN')].forEach((v,i)=>{ const td=document.createElement('td'); if(i>=2) td.className='n'; td.textContent=v; tr.append(td); });
     tb.append(tr); });
-  $('grand').textContent = l.entries.length ? 'Total: ₹'+l.grand_total.toLocaleString('en-IN') : 'No entries yet.';
+  $('grand').textContent = l.entries.length ? 'Total stock value: ₹'+l.grand_total.toLocaleString('en-IN')+'  ·  highlighted = below '+l.reorder_threshold+', restocks +'+l.restock_qty+' on the next order' : 'No entries yet.';
 }
 
 // ---------- upload zone ----------
